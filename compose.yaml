@@ -1,7 +1,6 @@
+version: "3.8"
+
 x-customizable-image: &customizable_image
-  # By default the image used only contains the `frappe` and `erpnext` apps.
-  # See https://github.com/frappe/frappe_docker/blob/main/docs/custom-apps.md
-  # about using custom images.
   image: ${CUSTOM_IMAGE:-frappe/erpnext}:${CUSTOM_TAG:-$ERPNEXT_VERSION}
   pull_policy: ${PULL_POLICY:-always}
   restart: ${RESTART_POLICY:-unless-stopped}
@@ -13,44 +12,108 @@ x-depends-on-configurator: &depends_on_configurator
 
 x-backend-defaults: &backend_defaults
   <<: [*depends_on_configurator, *customizable_image]
+  environment:
+    TZ: ${TZ}
   volumes:
     - sites:/home/frappe/frappe-bench/sites
 
 services:
+  # === DATA LAYER ===
+  mariadb:
+    image: mariadb:10.11
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${DB_NAME}
+      MYSQL_USER: ${DB_USER}
+      MYSQL_PASSWORD: ${DB_PASSWORD}
+      TZ: ${TZ}
+    command: >
+      mysqld
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --skip-character-set-client-handshake
+      --sql-mode="STRICT_TRANS_TABLES,NO_AUTO_CREATE_USER,NO_ENGINE_SUBSTITUTION"
+    volumes:
+      - db_data:/var/lib/mysql
+
+  redis-cache:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    volumes:
+      - redis_cache_data:/data
+
+  redis-queue:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    volumes:
+      - redis_queue_data:/data
+
+  # === CONFIG / BENCH GLOBAL SETTINGS ===
   configurator:
     <<: *backend_defaults
-    platform: linux/amd64
-    entrypoint:
-      - bash
-      - -c
-    # add redis_socketio for backward compatibility
-    command:
-      - >
-        ls -1 apps > sites/apps.txt;
-        bench set-config -g db_host $$DB_HOST;
-        bench set-config -gp db_port $$DB_PORT;
-        bench set-config -g redis_cache "redis://$$REDIS_CACHE";
-        bench set-config -g redis_queue "redis://$$REDIS_QUEUE";
-        bench set-config -g redis_socketio "redis://$$REDIS_QUEUE";
-        bench set-config -gp socketio_port $$SOCKETIO_PORT;
+    entrypoint: ["bash", "-c"]
+    command: >
+      ls -1 apps > sites/apps.txt;
+      bench set-config -g db_host ${DB_HOST};
+      bench set-config -gp db_port ${DB_PORT};
+      bench set-config -g redis_cache "redis://redis-cache:6379";
+      bench set-config -g redis_queue "redis://redis-queue:6379";
+      bench set-config -gp socketio_port 9000;
     environment:
-      DB_HOST: ${DB_HOST:-}
-      DB_PORT: ${DB_PORT:-}
-      REDIS_CACHE: ${REDIS_CACHE:-}
-      REDIS_QUEUE: ${REDIS_QUEUE:-}
-      SOCKETIO_PORT: 9000
-    depends_on: {}
+      DB_HOST: ${DB_HOST}
+      DB_PORT: ${DB_PORT}
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis-cache:
+        condition: service_started
+      redis-queue:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "bash", "-lc", "exit 0"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
     restart: on-failure
 
+  # === APP LAYER ===
   backend:
     <<: *backend_defaults
-    platform: linux/amd64
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis-cache:
+        condition: service_started
+      redis-queue:
+        condition: service_started
+
+  websocket:
+    <<: [*depends_on_configurator, *customizable_image]
+    command: ["node", "/home/frappe/frappe-bench/apps/frappe/socketio.js"]
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+    depends_on:
+      backend:
+        condition: service_started
+
+  queue-short:
+    <<: *backend_defaults
+    command: ["bench", "worker", "--queue", "short,default"]
+
+  queue-long:
+    <<: *backend_defaults
+    command: ["bench", "worker", "--queue", "long,default,short"]
+
+  scheduler:
+    <<: *backend_defaults
+    command: ["bench", "schedule"]
 
   frontend:
     <<: *customizable_image
-    platform: linux/amd64
-    command:
-      - nginx-entrypoint.sh
+    command: ["nginx-entrypoint.sh"]
     environment:
       BACKEND: backend:8000
       SOCKETIO: websocket:9000
@@ -60,36 +123,24 @@ services:
       UPSTREAM_REAL_IP_RECURSIVE: ${UPSTREAM_REAL_IP_RECURSIVE:-off}
       PROXY_READ_TIMEOUT: ${PROXY_READ_TIMEOUT:-120}
       CLIENT_MAX_BODY_SIZE: ${CLIENT_MAX_BODY_SIZE:-50m}
+      TZ: ${TZ}
     volumes:
       - sites:/home/frappe/frappe-bench/sites
     depends_on:
-      - backend
-      - websocket
+      backend:
+        condition: service_started
+      websocket:
+        condition: service_started
+    # Coolify подхватит этот порт для публичного домена
+    ports:
+      - "8080"
 
-  websocket:
-    <<: [*depends_on_configurator, *customizable_image]
-    platform: linux/amd64
-    command:
-      - node
-      - /home/frappe/frappe-bench/apps/frappe/socketio.js
-    volumes:
-      - sites:/home/frappe/frappe-bench/sites
-
-  queue-short:
-    <<: *backend_defaults
-    platform: linux/amd64
-    command: bench worker --queue short,default
-
-  queue-long:
-    <<: *backend_defaults
-    platform: linux/amd64
-    command: bench worker --queue long,default,short
-
-  scheduler:
-    <<: *backend_defaults
-    platform: linux/amd64
-    command: bench schedule
-
-# ERPNext requires local assets access (Frappe does not)
+# === PERSISTENT VOLUMES ===
 volumes:
   sites:
+  db_data:
+  redis_cache_data:
+  redis_queue_data:
+
+# === HEALTHCHECKS ===
+# MariaDB Healthcheck (ниже — через 'healthcheck' ключ у самого сервиса)
